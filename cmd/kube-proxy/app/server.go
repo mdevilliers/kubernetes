@@ -29,11 +29,15 @@ import (
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/client/clientcmd"
 	clientcmdapi "github.com/GoogleCloudPlatform/kubernetes/pkg/client/clientcmd/api"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/client/record"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/cloudprovider"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/proxy"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/proxy/config"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/types"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/util/exec"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/util/iptables"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/util/node"
 
 	"github.com/golang/glog"
 	"github.com/spf13/pflag"
@@ -49,6 +53,11 @@ type ProxyServer struct {
 	Master             string
 	Kubeconfig         string
 	PortRange          util.PortRange
+	CloudProvider      string
+	CloudConfigFile    string
+	Cloud              cloudprovider.Interface
+	Recorder           record.EventRecorder
+	nodeRef            *api.ObjectReference
 }
 
 // NewProxyServer creates a new ProxyServer object with default parameters
@@ -72,6 +81,9 @@ func (s *ProxyServer) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&s.ResourceContainer, "resource-container", s.ResourceContainer, "Absolute name of the resource-only container to create and run the Kube-proxy in (Default: /kube-proxy).")
 	fs.StringVar(&s.Kubeconfig, "kubeconfig", s.Kubeconfig, "Path to kubeconfig file with authorization information (the master location is set by the master flag).")
 	fs.Var(&s.PortRange, "proxy-port-range", "Range of host ports (beginPort-endPort, inclusive) that may be consumed in order to proxy service traffic. If unspecified (0-0) then ports will be randomly chosen.")
+	fs.StringVar(&s.CloudProvider, "cloud-provider", s.CloudProvider, "The provider for cloud services.  Empty string for no provider.")
+	fs.StringVar(&s.CloudConfigFile, "cloud-config", s.CloudConfigFile, "The path to the cloud provider configuration file.  Empty string for no configuration file.")
+
 }
 
 // Run runs the specified ProxyServer.  This should never exit.
@@ -146,7 +158,68 @@ func (s *ProxyServer) Run(_ []string) error {
 		}, 5*time.Second)
 	}
 
+	s.Cloud = cloudprovider.InitCloudProvider(s.CloudProvider, s.CloudConfigFile)
+	glog.V(2).Infof("Successfully initialized cloud provider: %q from the config file: %q\n", s.CloudProvider, s.CloudConfigFile)
+
+	if client != nil {
+		s.initEventRecorder(client)
+	} else {
+		glog.Warning("No api server defined - no events will be sent to API server.")
+	}
+
+	s.birthCry()
+
 	// Just loop forever for now...
 	proxier.SyncLoop()
 	return nil
+}
+
+// birthCry sends an event that the kube-proxy has started up.
+func (s *ProxyServer) birthCry() {
+	// Make an event that kube-proxy restarted.
+	s.Recorder.Eventf(s.nodeRef, "starting", "Starting kube-proxy.")
+}
+
+// initilises the eventRecorder
+func (s *ProxyServer) initEventRecorder(client *client.Client) {
+
+	hostName := s.getHostName()
+
+	s.nodeRef = &api.ObjectReference{
+		Kind:      "Node",
+		Name:      hostName,
+		UID:       types.UID(hostName),
+		Namespace: "",
+	}
+
+	eventBroadcaster := record.NewBroadcaster()
+	s.Recorder = eventBroadcaster.NewRecorder(api.EventSource{Component: "kube-proxy", Host: hostName})
+	eventBroadcaster.StartLogging(glog.V(3).Infof)
+
+	eventBroadcaster.StartRecordingToSink(client.Events(""))
+	glog.V(4).Infof("Sending events to api server.")
+}
+
+// helper function to determine the host name to use, delegates to cloud integration if configured
+func (s *ProxyServer) getHostName() string {
+
+	hostname := node.GetHostname("")
+
+	if s.Cloud != nil {
+		var err error
+		instances, ok := s.Cloud.Instances()
+		if !ok {
+			return hostname
+		}
+
+		hostnameFromInstance, err := instances.CurrentNodeName(hostname)
+		if err != nil {
+			return hostname
+		}
+
+		hostname = hostnameFromInstance
+		glog.V(2).Infof("cloud provider determined current node name to be %s", hostname)
+	}
+
+	return hostname
 }
